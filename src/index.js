@@ -1,4 +1,6 @@
+
 import { DurableObject } from "cloudflare:workers";
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -11,14 +13,12 @@ export default {
       return new Response("Not found", { status: 404 });
     }
 
-    if (request.headers.get("Upgrade") !== "websocket") {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
       return new Response("WebSocket required", { status: 426 });
     }
 
     const id = env.ROOMS.idFromName("puffbrawl-main");
-    const room = env.ROOMS.get(id);
-
-    return room.fetch(request);
+    return env.ROOMS.get(id).fetch(request);
   }
 };
 
@@ -45,54 +45,71 @@ export class GameRoom extends DurableObject {
       server.serializeAttachment({
         code,
         player: 1,
-        status: "playing"
+        status: "waiting",
+        queue: false
       });
 
       server.send(JSON.stringify({
         type: "room-created",
         code
       }));
-    }
 
-    else if (mode === "join") {
-      const code = (url.searchParams.get("code") || "").toUpperCase();
+    } else if (mode === "join") {
+      const code = (url.searchParams.get("code") || "")
+        .trim()
+        .toUpperCase();
 
-      const existing = this.ctx.getWebSockets()
-        .find(ws => {
-          const data = ws.deserializeAttachment();
-          return data?.code === code && data?.status === "playing";
-        });
-
-      if (!existing) {
-        server.send(JSON.stringify({
-          type: "error",
-          message: "Sala não encontrada."
-        }));
-        server.close();
+      if (!/^[A-Z0-9]{6}$/.test(code)) {
+        this.sendError(server, "Código de sala inválido.");
       } else {
-        server.serializeAttachment({
-          code,
-          player: 2,
-          status: "playing"
-        });
+        const host = this.ctx.getWebSockets().find(ws => {
+          if (ws === server) return false;
 
-        existing.send(JSON.stringify({
-          type: "opponent-joined"
-        }));
-
-        server.send(JSON.stringify({
-          type: "room-joined",
-          code
-        }));
-      }
-    }
-
-    else if (mode === "match") {
-      const waiting = this.ctx.getWebSockets()
-        .find(ws => {
           const data = ws.deserializeAttachment();
-          return data?.status === "waiting";
+
+          return data?.code === code &&
+            data?.player === 1 &&
+            data?.status === "waiting" &&
+            data?.queue === false;
         });
+
+        if (!host) {
+          this.sendError(server, "Sala não encontrada ou já está cheia.");
+        } else {
+          host.serializeAttachment({
+            ...host.deserializeAttachment(),
+            status: "playing"
+          });
+
+          server.serializeAttachment({
+            code,
+            player: 2,
+            status: "playing",
+            queue: false
+          });
+
+          host.send(JSON.stringify({
+            type: "opponent-joined",
+            player: 2
+          }));
+
+          server.send(JSON.stringify({
+            type: "room-joined",
+            code,
+            player: 2
+          }));
+        }
+      }
+
+    } else if (mode === "match") {
+      const waiting = this.ctx.getWebSockets().find(ws => {
+        if (ws === server) return false;
+
+        const data = ws.deserializeAttachment();
+
+        return data?.status === "waiting" &&
+          data?.queue === true;
+      });
 
       if (waiting) {
         const code = this.makeCode();
@@ -100,13 +117,15 @@ export class GameRoom extends DurableObject {
         waiting.serializeAttachment({
           code,
           player: 1,
-          status: "playing"
+          status: "playing",
+          queue: false
         });
 
         server.serializeAttachment({
           code,
           player: 2,
-          status: "playing"
+          status: "playing",
+          queue: false
         });
 
         waiting.send(JSON.stringify({
@@ -118,23 +137,21 @@ export class GameRoom extends DurableObject {
           type: "match-found",
           player: 2
         }));
+
       } else {
         server.serializeAttachment({
-          status: "waiting"
+          player: 0,
+          status: "waiting",
+          queue: true
         });
 
         server.send(JSON.stringify({
           type: "searching"
         }));
       }
-    }
 
-    else {
-      server.send(JSON.stringify({
-        type: "error",
-        message: "Modo inválido."
-      }));
-      server.close();
+    } else {
+      this.sendError(server, "Modo inválido.");
     }
 
     return new Response(null, {
@@ -146,15 +163,24 @@ export class GameRoom extends DurableObject {
   webSocketMessage(ws, message) {
     const data = ws.deserializeAttachment();
 
-    if (!data?.code) return;
+    if (!data?.code || data.status !== "playing") return;
 
     for (const peer of this.ctx.getWebSockets()) {
       if (peer === ws) continue;
 
       const peerData = peer.deserializeAttachment();
 
-      if (peerData?.code === data.code) {
-        peer.send(message);
+      if (
+        peerData?.code === data.code &&
+        peerData?.status === "playing"
+      ) {
+        try {
+          peer.send(message);
+        } catch {
+          try {
+            peer.close(1011, "Falha ao encaminhar mensagem");
+          } catch {}
+        }
       }
     }
   }
@@ -165,22 +191,65 @@ export class GameRoom extends DurableObject {
     if (!data?.code) return;
 
     for (const peer of this.ctx.getWebSockets()) {
+      if (peer === ws) continue;
+
       const peerData = peer.deserializeAttachment();
 
       if (peerData?.code === data.code) {
-        peer.send(JSON.stringify({
-          type: "opponent-left"
-        }));
+        peer.serializeAttachment({
+          ...peerData,
+          status: "disconnected"
+        });
+
+        try {
+          peer.send(JSON.stringify({
+            type: "opponent-left"
+          }));
+        } catch {}
       }
     }
   }
 
   webSocketError(ws) {
-    ws.close();
+    try {
+      ws.close(1011, "Erro de WebSocket");
+    } catch {}
+  }
+
+  sendError(ws, message) {
+    try {
+      ws.send(JSON.stringify({
+        type: "error",
+        message
+      }));
+
+      ws.close(1008, message);
+    } catch {}
   }
 
   makeCode() {
-    return Math.random().toString(36)
-      .substring(2, 8).toUpperCase();
+    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let code;
+
+    do {
+      code = "";
+
+      for (let i = 0; i < 6; i++) {
+        code += chars[
+          Math.floor(Math.random() * chars.length)
+        ];
+      }
+
+    } while (this.ctx.getWebSockets().some(ws => {
+      const data = ws.deserializeAttachment();
+
+      return data?.code === code &&
+        (
+          data.status === "waiting" ||
+          data.status === "playing"
+        );
+    }));
+
+    return code;
   }
 }
