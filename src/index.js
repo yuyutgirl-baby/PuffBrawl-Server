@@ -1,4 +1,4 @@
-
+import { DurableObject } from "cloudflare:workers";p
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -22,8 +22,9 @@ export default {
   }
 };
 
-export class GameRoom {
+export class GameRoom extends DurableObject {
   constructor(ctx, env) {
+    super(ctx, env);:
     this.ctx = ctx;
     this.env = env;
   }
