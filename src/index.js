@@ -24,7 +24,7 @@ export default {
 
 export class GameRoom extends DurableObject {
   constructor(ctx, env) {
-    super(ctx, env);:
+    super(ctx, env);
     this.ctx = ctx;
     this.env = env;
   }
